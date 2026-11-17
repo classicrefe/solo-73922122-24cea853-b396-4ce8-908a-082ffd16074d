@@ -106,7 +106,7 @@ def partition_count(month: str) -> int:
 
 
 class ChaosWriter(threading.Thread):
-    """独立采集连接：直接 SQL 随机 新增/更正/删除，并维护期望结果。"""
+    """独立采集连接：直接 SQL 随机 新增/更正/删除/改站号，并维护期望结果。"""
 
     def __init__(self, month: str, expected: dict):
         super().__init__(daemon=True)
@@ -126,14 +126,24 @@ class ChaosWriter(threading.Thread):
             return
         with conn:
             while not self.stop_event.is_set():
-                op = random.choices(["insert", "update", "delete"],
-                                    weights=[5, 3, 2])[0]
+                op = random.choices(
+                    ["insert", "update", "delete", "rekey"],
+                    weights=[4, 3, 2, 3],
+                )[0]
                 try:
                     self._do(conn, op)
                     self.ops += 1
                 except Exception as e:  # noqa: BLE001
                     self.errors.append(f"{op}: {e!r}")
                 time.sleep(random.uniform(0.01, 0.06))
+
+    def _free_station(self, conn, ts, current):
+        used = {r[0] for r in conn.execute(
+            "SELECT station_id FROM observations WHERE ts = %s", (ts,))}
+        for s in random.sample(STATIONS, len(STATIONS)):
+            if s != current and s not in used:
+                return s
+        return None
 
     def _do(self, conn, op: str):
         if op == "insert":
@@ -149,6 +159,25 @@ class ChaosWriter(threading.Thread):
             ).fetchone()
             if row:
                 self.expected[(row[0], row[1])] = row[2]
+        elif op == "rekey":
+            row = conn.execute(
+                "SELECT station_id, ts, value FROM observations"
+                " WHERE ts >= %s AND ts < %s ORDER BY random() LIMIT 1",
+                (self.lo, self.hi),
+            ).fetchone()
+            if not row:
+                return
+            old_station, ts, value = row
+            new_station = self._free_station(conn, ts, old_station)
+            if not new_station:
+                return
+            conn.execute(
+                "UPDATE observations SET station_id = %s"
+                " WHERE station_id = %s AND ts = %s",
+                (new_station, old_station, ts),
+            )
+            self.expected.pop((old_station, ts), None)
+            self.expected[(new_station, ts)] = value
         elif op == "update":
             row = conn.execute(
                 "SELECT station_id, ts FROM observations"
@@ -175,6 +204,174 @@ class ChaosWriter(threading.Thread):
                     (row[0], row[1]),
                 )
                 self.expected.pop((row[0], row[1]), None)
+
+
+class InterleaveWriter(threading.Thread):
+    """确定性改键交错写入器：专门覆盖"影子表复制旧键后采集端更正身份"的场景。
+
+    迁移进入 copying 后按固定脚本执行（全部独立连接、直接 SQL、自动提交）：
+      A. 取一行已大概率被复制的旧观测，改站号（旧键消失、新键出现）；
+      B. 对 A 的新键再改同月时刻（连续两次改主键）；
+      C. 删除一个旧键，随后用同一主键插入新观测（旧键复用）；
+      D. 把一条观测跨月移动到另一个未迁移月份（本月消失）；
+      E. 随机测值更正与删除，持续到切换完成。
+    维护 expected 映射作为迁移后父表应有的逐行 ground truth。
+    """
+
+    def __init__(self, month: str, expected: dict, other_month: str):
+        super().__init__(daemon=True)
+        self.month = month
+        self.other = other_month
+        self.expected = expected
+        self.stop_event = threading.Event()
+        self.errors: list[str] = []
+        self.events: list[str] = []
+        self.lo, self.hi = month_range(month)
+        self.olo, self.ohi = month_range(other_month)
+
+    def _pick(self, conn):
+        return conn.execute(
+            "SELECT station_id, ts, value FROM observations"
+            " WHERE ts >= %s AND ts < %s ORDER BY random() LIMIT 1",
+            (self.lo, self.hi),
+        ).fetchone()
+
+    def _free_station(self, conn, ts, current):
+        used = {r[0] for r in conn.execute(
+            "SELECT station_id FROM observations WHERE ts = %s", (ts,))}
+        for s in STATIONS:
+            if s != current and s not in used:
+                return s
+        return None
+
+    def _free_ts(self, conn, station, lo, hi, blocked):
+        span = int((hi - lo).total_seconds())
+        for _ in range(30):
+            ts = lo + timedelta(seconds=random.randrange(span))
+            if ts == blocked:
+                continue
+            if not conn.execute(
+                "SELECT 1 FROM observations WHERE station_id = %s AND ts = %s",
+                (station, ts),
+            ).fetchone():
+                return ts
+        return None
+
+    def run(self):
+        try:
+            conn = psycopg.connect(DSN, autocommit=True,
+                                   options="-c timezone=UTC")
+        except Exception as e:  # noqa: BLE001
+            self.errors.append(f"connect: {e!r}")
+            return
+        with conn:
+            try:
+                # 等复制真正开始，保证被选中的行有机会已进入影子表
+                deadline = time.time() + 60
+                while not self.stop_event.is_set() and time.time() < deadline:
+                    r = run_row(self.month)
+                    if r and r[1] and r[1] > 0:
+                        break
+                    time.sleep(0.1)
+                self._scenario_a_b(conn)
+                self._scenario_c(conn)
+                self._scenario_d(conn)
+                # 切换前持续做测值更正/删除，增加回放与对账压力
+                while not self.stop_event.is_set():
+                    row = self._pick(conn)
+                    if row and random.random() < 0.5:
+                        v = random.randint(0, 100)
+                        conn.execute(
+                            "UPDATE observations SET value = %s"
+                            " WHERE station_id = %s AND ts = %s",
+                            (v, row[0], row[1]))
+                        self.expected[(row[0], row[1])] = v
+                    elif row:
+                        conn.execute(
+                            "DELETE FROM observations"
+                            " WHERE station_id = %s AND ts = %s",
+                            (row[0], row[1]))
+                        self.expected.pop((row[0], row[1]), None)
+                    time.sleep(0.03)
+            except Exception as e:  # noqa: BLE001
+                self.errors.append(f"interleave: {e!r}")
+
+    def _scenario_a_b(self, conn):
+        # 种子每个时刻 8 站全占：先在某时刻删出空位，再把【同一时刻】的另一行
+        # 改到该空位站号（真实更正链路亦然），保证改键一定发生而非静默跳过。
+        victim = self._pick(conn)
+        if not victim:
+            return
+        v_station, v_ts, _ = victim
+        conn.execute(
+            "DELETE FROM observations WHERE station_id = %s AND ts = %s",
+            (v_station, v_ts))
+        self.expected.pop((v_station, v_ts), None)
+        self.events.append(f"A0 delete-victim {v_station} @{v_ts}")
+        # 取同一时刻、与被删站号不同的另一行
+        row = conn.execute(
+            "SELECT station_id, ts, value FROM observations"
+            " WHERE ts = %s AND station_id <> %s ORDER BY random() LIMIT 1",
+            (v_ts, v_station),
+        ).fetchone()
+        if not row:
+            return
+        old_station, ts, value = row
+        # 被删的 v_station 在该时刻一定空闲
+        new_station = self._free_station(conn, ts, old_station)
+        if not new_station:
+            return
+        # A: 改站号 —— 旧键 (old_station, ts) 本应消失
+        conn.execute(
+            "UPDATE observations SET station_id = %s"
+            " WHERE station_id = %s AND ts = %s",
+            (new_station, old_station, ts))
+        self.expected.pop((old_station, ts), None)
+        self.expected[(new_station, ts)] = value
+        self.events.append(f"A rekey {old_station}->{new_station} @{ts}")
+        # B: 再改同月时刻 —— 第二次主键更正
+        new_ts = self._free_ts(conn, new_station, self.lo, self.hi, ts)
+        if not new_ts:
+            return
+        conn.execute(
+            "UPDATE observations SET ts = %s WHERE station_id = %s AND ts = %s",
+            (new_ts, new_station, ts))
+        self.expected.pop((new_station, ts), None)
+        self.expected[(new_station, new_ts)] = value
+        self.events.append(f"B rekey-ts {ts}->{new_ts} @{new_station}")
+
+    def _scenario_c(self, conn):
+        row = self._pick(conn)
+        if not row:
+            return
+        station, ts, _ = row
+        # 删除旧键
+        conn.execute(
+            "DELETE FROM observations WHERE station_id = %s AND ts = %s",
+            (station, ts))
+        self.expected.pop((station, ts), None)
+        self.events.append(f"C delete {station} @{ts}")
+        # 同一主键立刻插入新观测（旧键复用）
+        value = random.randint(0, 100)
+        conn.execute(
+            "INSERT INTO observations (station_id, ts, value) VALUES (%s,%s,%s)",
+            (station, ts, value))
+        self.expected[(station, ts)] = value
+        self.events.append(f"C reinsert {station} @{ts} = {value}")
+
+    def _scenario_d(self, conn):
+        row = self._pick(conn)
+        if not row:
+            return
+        station, ts, value = row
+        new_ts = self._free_ts(conn, station, self.olo, self.ohi, ts)
+        if not new_ts:
+            return
+        conn.execute(
+            "UPDATE observations SET ts = %s WHERE station_id = %s AND ts = %s",
+            (new_ts, station, ts))
+        self.expected.pop((station, ts), None)
+        self.events.append(f"D cross-month {station} {ts}->{new_ts}")
 
 
 # ------------------------------------------------------------------ app 进程
@@ -335,11 +532,14 @@ def test_fail_and_retry(month: str, fail_at: str):
     verify_month(month, expected, f"重试({fail_at})")
 
 
-def test_process_kill(month: str):
-    print(f"\n== 用例：复制进行中应用进程硬退出（{month}）==", flush=True)
+def test_process_kill(month: str, other: str):
+    print(f"\n== 用例：复制进行中应用进程硬退出，重启续迁（{month}）==", flush=True)
     expected = snapshot(month)
     r = api_migrate(month, batch_size=150, sleep_ms=150)
     check("迁移启动成功", r.ok, r.text[:200])
+    # 迁移期间叠加确定性改键交错（改站号/改时刻/旧键复用/跨月）
+    writer = InterleaveWriter(month, expected, other)
+    writer.start()
     # 等复制真正开始
     deadline = time.time() + 60
     while time.time() < deadline:
@@ -352,6 +552,11 @@ def test_process_kill(month: str):
           f"run={row}")
     crash_app()
     time.sleep(1)
+    writer.stop_event.set()
+    writer.join(timeout=10)
+    check("崩溃前改键交错写入无错误", not writer.errors,
+          "; ".join(writer.errors[:3]))
+    print("  崩溃前改键事件：" + " | ".join(writer.events))
     # 应用已死：父表仍完整可查，且采集写入（直接 SQL）仍可提交
     got = snapshot(month)
     check("进程被杀后父表内容完整", got == expected,
@@ -363,17 +568,76 @@ def test_process_kill(month: str):
     probe.join(timeout=10)
     check("应用停机期间直接 SQL 写入正常", probe.ops > 0 and not probe.errors,
           f"ops={probe.ops} err={probe.errors[:2]}")
-    # 重启应用，重试迁移
+    # 重启应用，重试迁移，并继续改键交错
     start_app()
     r2 = api_migrate(month, sleep_ms=60)
     check("重启后重试启动成功", r2.ok, r2.text[:200])
-    writer = ChaosWriter(month, expected)
+    writer2 = InterleaveWriter(month, expected, other)
+    writer2.start()
+    status = wait_status(month, {"done", "failed"})
+    writer2.stop_event.set()
+    writer2.join(timeout=10)
+    check("崩溃恢复后迁移完成", status == "done", f"status={status}")
+    check("续迁期改键交错写入无错误", not writer2.errors,
+          "; ".join(writer2.errors[:3]))
+    verify_month(month, expected, "崩溃恢复")
+
+
+def run_interleave(month: str, other: str, label: str, **kw):
+    """迁移 month，期间用确定性改键交错写入器制造改主键/复用/跨月场景。"""
+    expected = snapshot(month)
+    params = {"batch_size": 80, "sleep_ms": 120}
+    params.update(kw)
+    r = api_migrate(month, **params)
+    check(f"{label}: 迁移启动成功", r.ok, r.text[:200])
+    writer = InterleaveWriter(month, expected, other)
     writer.start()
     status = wait_status(month, {"done", "failed"})
     writer.stop_event.set()
     writer.join(timeout=10)
-    check("崩溃恢复后迁移完成", status == "done", f"status={status}")
-    verify_month(month, expected, "崩溃恢复")
+    check(f"{label}: 迁移完成", status == "done", f"status={status} err={run_row(month)}")
+    check(f"{label}: 交错写入无错误", not writer.errors, "; ".join(writer.errors[:3]))
+    print("  改键脚本事件：" + " | ".join(writer.events))
+    verify_month(month, expected, label)
+    return writer
+
+
+def test_key_correction_interleave(month: str, other: str):
+    print(f"\n== 用例2：改站号/改时刻/旧键复用/跨月 交错（{month}，跨月目标 {other}）==",
+          flush=True)
+    run_interleave(month, other, "改键交错")
+    # 跨月移入的行应出现在目标月的父表查询里（目标月此时尚未迁移）
+    moved = snapshot(other)
+    check("跨月移入的观测可在目标月父表查到", len(moved) > 0,
+          f"目标月行数 {len(moved)}")
+
+
+def test_rekey_with_replay_interrupt(month: str, other: str):
+    print(f"\n== 用例：applying 回放中断后重试，改键不复活（{month}）==", flush=True)
+    expected = snapshot(month)
+    # 首轮就并发改键，保证 applying 阶段确实有增量可回放，故障才会注入
+    w1 = InterleaveWriter(month, expected, other)
+    w1.start()
+    r = api_migrate(month, fail_at="applying", batch_size=80, sleep_ms=60)
+    check("迁移启动成功", r.ok, r.text[:200])
+    status = wait_status(month, {"failed", "done"}, timeout=120)
+    w1.stop_event.set()
+    w1.join(timeout=10)
+    check("applying 故障注入后状态为 failed", status == "failed", f"status={status}")
+    check("首轮改键写入无错误", not w1.errors, "; ".join(w1.errors[:3]))
+    check("中断后父表内容完整不变", snapshot(month) == expected,
+          f"{len(snapshot(month))} vs {len(expected)}")
+    # 重试期间继续做改键交错，验证已删除/已回放增量的重复执行安全
+    r2 = api_migrate(month, batch_size=80, sleep_ms=60)
+    check("重试启动成功", r2.ok, r2.text[:200])
+    writer = InterleaveWriter(month, expected, other)
+    writer.start()
+    status = wait_status(month, {"done", "failed"})
+    writer.stop_event.set()
+    writer.join(timeout=10)
+    check("重试后迁移完成", status == "done", f"status={status}")
+    check("重试期交错写入无错误", not writer.errors, "; ".join(writer.errors[:3]))
+    verify_month(month, expected, "回放中断重试")
 
 
 def main():
@@ -385,9 +649,9 @@ def main():
             "       count(*) FROM observations_default"
             " GROUP BY 1 ORDER BY 1"
         )]
-    check("种子数据至少 4 个月份", len(months) >= 4, f"months={months}")
+    check("种子数据至少 6 个月份", len(months) >= 6, f"months={months}")
     NEXT_MONTHS = months
-    m1, m2, m3, m4 = months[:4]
+    m1, m2, m3, m4, m5, m6 = months[:6]
 
     start_app()
     try:
@@ -396,7 +660,11 @@ def main():
         test_happy_path(m1)
         test_fail_and_retry(m2, "copying")
         test_fail_and_retry(m3, "finalizing")
-        test_process_kill(m4)
+        test_process_kill(m4, m1)
+        # 新增：围绕"采集端更正观测身份（改主键）"的关键交错过程。
+        # 跨月移动目标选已完成的 m1：它已在月分区，UPDATE 跨分区由父表触发器覆盖。
+        test_key_correction_interleave(m5, m1)
+        test_rekey_with_replay_interrupt(m6, m1)
     finally:
         crash_app()
 

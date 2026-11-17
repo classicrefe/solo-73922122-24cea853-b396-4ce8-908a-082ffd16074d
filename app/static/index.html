@@ -94,6 +94,11 @@
       <button onclick="doWrite('delete')">删除观测</button>
     </div>
     <div class="row">
+      <button class="ghost" onclick="doWrite('rekey_station')">更正站号(改主键)</button>
+      <button class="ghost" onclick="doWrite('rekey_ts')">更正同月时刻(改主键)</button>
+      <button class="ghost" onclick="doWrite('move_month')">跨月移动时刻</button>
+    </div>
+    <div class="row">
       <label>自动采集间隔ms</label><input id="wInterval" type="number" value="300" style="width:80px">
       <button id="wAuto" class="ghost">启动自动采集</button>
       <span id="wState" class="dim">已停止</span>

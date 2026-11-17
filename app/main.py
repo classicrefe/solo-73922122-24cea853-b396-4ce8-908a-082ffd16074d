@@ -175,16 +175,55 @@ def api_query(month: str, limit: int = 20):
 STATIONS = [f"ST{i:03d}" for i in range(1, 9)]
 
 
-def _random_ts_in_month(conn, lo: str, hi: str) -> str:
+def _random_ts_in_month(conn, lo: str, hi: str):
+    """月内随机时刻，返回带时区的 datetime（psycopg 可直接绑定到 timestamptz）。"""
     return conn.execute(
         "SELECT (%s::timestamptz + random() * (%s::timestamptz - %s::timestamptz))"
         "::timestamptz",
         (lo, hi, lo),
-    ).fetchone()[0].isoformat()
+    ).fetchone()[0]
+
+
+def _random_row(conn, lo: str, hi: str):
+    return conn.execute(
+        "SELECT station_id, ts, value FROM observations"
+        " WHERE ts >= %s::date AND ts < %s::date"
+        " ORDER BY random() LIMIT 1",
+        (lo, hi),
+    ).fetchone()
+
+
+def _free_station(conn, ts, current: str) -> str | None:
+    """找一个在 ts 时刻尚未占用的其他站号（供改站号更正使用）。"""
+    for s in random.sample(STATIONS, len(STATIONS)):
+        if s == current:
+            continue
+        hit = conn.execute(
+            "SELECT 1 FROM observations WHERE station_id = %s AND ts = %s",
+            (s, ts),
+        ).fetchone()
+        if not hit:
+            return s
+    return None
+
+
+def _free_ts(conn, lo: str, hi: str, station: str, old_ts):
+    """在目标月内为该站号找一个未占用的随机时刻。"""
+    for _ in range(12):
+        ts = _random_ts_in_month(conn, lo, hi)
+        if ts == old_ts:
+            continue
+        hit = conn.execute(
+            "SELECT 1 FROM observations WHERE station_id = %s AND ts = %s",
+            (station, ts),
+        ).fetchone()
+        if not hit:
+            return ts
+    return None
 
 
 def demo_write(op: str, month: str) -> dict:
-    """模拟独立采集连接：每次新建连接，对父表直接 INSERT/UPDATE/DELETE。"""
+    """模拟独立采集连接：每次新建连接，对父表直接 INSERT/UPDATE/DELETE/改键。"""
     m = parse_month(month)
     lo, hi = m.isoformat(), next_month(m).isoformat()
     with connect() as conn:  # 独立连接，自动提交
@@ -203,13 +242,80 @@ def demo_write(op: str, month: str) -> dict:
                     return {"op": "insert", "station_id": row[0],
                             "ts": row[1].isoformat(), "value": row[2]}
             return {"op": "insert", "skipped": "随机主键冲突，未写入"}
+        # 改站号更正：UPDATE 主键的 station_id 部分（采集端用独立 SQL 更正站号）
+        if op == "rekey_station":
+            # 优先选"该时刻尚有空闲站号"的行，避免与同刻其他行主键冲突
+            row = conn.execute(
+                "SELECT station_id, ts, value FROM observations"
+                " WHERE ts >= %s::date AND ts < %s::date"
+                "   AND ts IN (SELECT ts FROM observations"
+                "               WHERE ts >= %s::date AND ts < %s::date"
+                "               GROUP BY ts HAVING count(*) < %s)"
+                " ORDER BY random() LIMIT 1",
+                (lo, hi, lo, hi, len(STATIONS)),
+            ).fetchone()
+            if not row:
+                return {"op": op, "skipped": "该月各时刻站号均已占满，无空位可改"}
+            old_station, ts, old_value = row
+            new_station = _free_station(conn, ts, old_station)
+            if not new_station:
+                return {"op": op, "skipped": "该时刻所有站号均被占用"}
+            conn.execute(
+                "UPDATE observations SET station_id = %s"
+                " WHERE station_id = %s AND ts = %s",
+                (new_station, old_station, ts),
+            )
+            return {"op": op, "ts": ts.isoformat(),
+                    "old_station_id": old_station, "station_id": new_station,
+                    "value": old_value}
+        # 改同月时刻更正：UPDATE 主键的 ts 部分，仍在本月
+        if op == "rekey_ts":
+            row = _random_row(conn, lo, hi)
+            if not row:
+                return {"op": op, "skipped": "该月没有可操作的数据"}
+            station, old_ts, old_value = row
+            new_ts = _free_ts(conn, lo, hi, station, old_ts)
+            if not new_ts:
+                return {"op": op, "skipped": "找不到空闲时刻"}
+            conn.execute(
+                "UPDATE observations SET ts = %s"
+                " WHERE station_id = %s AND ts = %s",
+                (new_ts, station, old_ts),
+            )
+            return {"op": op, "station_id": station,
+                    "old_ts": old_ts.isoformat(), "ts": new_ts.isoformat(),
+                    "value": old_value}
+        # 跨月时刻更正：把一条观测移动到相邻/其他月份
+        if op == "move_month":
+            row = _random_row(conn, lo, hi)
+            if not row:
+                return {"op": op, "skipped": "该月没有可操作的数据"}
+            station, old_ts, old_value = row
+            target = conn.execute(
+                "SELECT (date_trunc('month', ts AT TIME ZONE 'UTC'))::date"
+                " FROM observations GROUP BY 1"
+                " HAVING (date_trunc('month', ts AT TIME ZONE 'UTC'))::date <> %s"
+                " ORDER BY random() LIMIT 1",
+                (m,),
+            ).fetchone()
+            if not target:
+                return {"op": op, "skipped": "没有其他月份可移动"}
+            tm = target[0]
+            tlo, thi = tm.isoformat(), next_month(tm).isoformat()
+            new_ts = _free_ts(conn, tlo, thi, station, old_ts)
+            if not new_ts:
+                return {"op": op, "skipped": "目标月份找不到空闲时刻"}
+            conn.execute(
+                "UPDATE observations SET ts = %s"
+                " WHERE station_id = %s AND ts = %s",
+                (new_ts, station, old_ts),
+            )
+            return {"op": op, "station_id": station,
+                    "old_ts": old_ts.isoformat(), "ts": new_ts.isoformat(),
+                    "from_month": month, "to_month": tm.isoformat()[:7],
+                    "value": old_value}
         # update / delete 先随机取该月一行
-        row = conn.execute(
-            "SELECT station_id, ts, value FROM observations"
-            " WHERE ts >= %s::date AND ts < %s::date"
-            " ORDER BY random() LIMIT 1",
-            (lo, hi),
-        ).fetchone()
+        row = _random_row(conn, lo, hi)
         if not row:
             return {"op": op, "skipped": "该月没有可操作的数据"}
         if op == "update":
@@ -256,7 +362,11 @@ _auto_lock = threading.Lock()
 
 
 def _auto_loop(month: str, interval_ms: int):
-    ops = ["insert"] * 5 + ["update"] * 3 + ["delete"] * 2
+    # 含改主键类更正（改站号/改同月时刻/跨月移动），持续演练增量捕获的改键路径
+    ops = (
+        ["insert"] * 4 + ["update"] * 3 + ["delete"] * 2
+        + ["rekey_station", "rekey_ts", "move_month"]
+    )
     while not _auto_stop.is_set():
         try:
             result = demo_write(random.choice(ops), month)

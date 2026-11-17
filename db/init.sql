@@ -32,14 +32,22 @@ CREATE TABLE IF NOT EXISTS migration_runs (
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
--- 增量变更日志：迁移期间默认分区上该月数据的 INSERT/UPDATE/DELETE
+-- 增量变更日志：迁移期间默认分区上该月数据的 INSERT/UPDATE/DELETE。
+-- 关键点：采集端可能"更正观测身份"（改站号、改同月时刻、跨月移动时刻），
+-- 即 UPDATE 会改变主键 (station_id, ts)。因此每条变更同时记录 OLD/NEW 两套键：
+--   insert : OLD 为空，NEW 为新行
+--   delete : OLD 为被删行，NEW 为空
+--   update : OLD/NEW 都可能存在；同月改键时两者不同，跨月移动时其一落在月外而为空
+-- value 始终取 NEW.value（delete 时为 NULL）。
 CREATE TABLE IF NOT EXISTS migration_delta (
-    seq         bigserial PRIMARY KEY,
-    month       date        NOT NULL,
-    op          text        NOT NULL CHECK (op IN ('insert','update','delete')),
-    station_id  text        NOT NULL,
-    ts          timestamptz NOT NULL,
-    value       integer
+    seq          bigserial PRIMARY KEY,
+    month        date        NOT NULL,
+    op           text        NOT NULL CHECK (op IN ('insert','update','delete')),
+    old_station  text,
+    old_ts       timestamptz,
+    new_station  text,
+    new_ts       timestamptz,
+    value        integer
 );
 CREATE INDEX IF NOT EXISTS migration_delta_month_seq
     ON migration_delta (month, seq);

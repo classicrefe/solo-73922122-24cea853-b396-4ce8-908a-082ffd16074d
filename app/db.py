@@ -66,12 +66,14 @@ def ensure_meta_tables():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS migration_delta (
-                seq         bigserial PRIMARY KEY,
-                month       date        NOT NULL,
-                op          text        NOT NULL,
-                station_id  text        NOT NULL,
-                ts          timestamptz NOT NULL,
-                value       integer
+                seq          bigserial PRIMARY KEY,
+                month        date        NOT NULL,
+                op           text        NOT NULL,
+                old_station  text,
+                old_ts       timestamptz,
+                new_station  text,
+                new_ts       timestamptz,
+                value        integer
             )
             """
         )
@@ -79,3 +81,33 @@ def ensure_meta_tables():
             "CREATE INDEX IF NOT EXISTS migration_delta_month_seq "
             "ON migration_delta (month, seq)"
         )
+        _upgrade_delta_schema(conn)
+
+
+def _upgrade_delta_schema(conn):
+    """旧版库（单键 station_id/ts）平滑升级为 OLD/NEW 双键结构。
+
+    升级只在没有迁移进行时安全：旧结构无法表达改键，存在进行中迁移的
+    旧库不应出现；此处仅在列缺失时按"OLD=NEW=旧键"回填，历史语义保持不变。
+    """
+    cols = {
+        r[0]
+        for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_name = 'migration_delta'"
+        )
+    }
+    if "new_station" in cols:
+        return
+    conn.execute("ALTER TABLE migration_delta ADD COLUMN old_station text")
+    conn.execute("ALTER TABLE migration_delta ADD COLUMN old_ts timestamptz")
+    conn.execute("ALTER TABLE migration_delta ADD COLUMN new_station text")
+    conn.execute("ALTER TABLE migration_delta ADD COLUMN new_ts timestamptz")
+    conn.execute(
+        "UPDATE migration_delta SET "
+        "old_station = station_id, old_ts = ts,"
+        "new_station = station_id, new_ts = ts "
+        "WHERE station_id IS NOT NULL"
+    )
+    conn.execute("ALTER TABLE migration_delta DROP COLUMN station_id")
+    conn.execute("ALTER TABLE migration_delta DROP COLUMN ts")

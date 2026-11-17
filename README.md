@@ -13,7 +13,7 @@ observations_default  -- 初始唯一分区（DEFAULT），历史数据都在这
 ```
 
 元数据表：`migration_runs`（每月迁移状态机 + 进度断点）、
-`migration_delta`（迁移期间触发器捕获的增量变更）。
+`migration_delta`（迁移期间触发器捕获的增量变更，携带 OLD/NEW 双键）。
 
 ## 快速开始
 
@@ -41,7 +41,8 @@ PGHOME=/path/to/pgsql PY=python3 bash scripts/dev_up.sh   # 初始化DB+种子+�
 1. **月份总览**：各月在默认分区的行数、已挂载月分区、迁移状态。
 2. **迁移控制**：选月份 → 设批大小/批间休眠（慢复制）→ 开始迁移；进度条实时刷新。
    一次只迁一个月（进行中再发起会收到 409）。
-3. **采集写入演示**：对选定月份手动或自动（可调间隔）做直接 SQL 增/改/删——
+3. **采集写入演示**：对选定月份手动或自动（可调间隔）做直接 SQL 增/改/删，
+   以及**更正站号、更正同月时刻、跨月移动时刻**（后三者会改变主键）——
    每次都用**独立连接**写父表，模拟真实采集链路。
 4. **父表查询**：迁移任意时刻查询父表，行数、主键重复数（恒为 0）、样本行。
 5. **一致性校验**：父表行数 / 默认分区剩余（完成后为 0）/ 月分区行数三方核对。
@@ -50,16 +51,24 @@ PGHOME=/path/to/pgsql PY=python3 bash scripts/dev_up.sh   # 初始化DB+种子+�
 
 | 阶段 | 做什么 | 是否锁写 |
 |---|---|---|
-| preparing | 建带 CHECK 的影子表、默认分区上挂增量触发器、登记运行记录 | 仅 DDL 瞬间 |
+| preparing | 建带 CHECK 的影子表、**父表上挂语句级增量触发器（OLD/NEW 过渡表）**、登记运行记录 | 仅 DDL 瞬间 |
 | waiting | 等触发器创建前开启的老事务结束（轮询 pg_stat_activity） | 否 |
 | copying | 键集分页分批 `INSERT..ON CONFLICT` 复制，进度落库，可 sleep 放慢 | 否 |
-| applying | 按 seq 顺序回放 `migration_delta`（insert/update→upsert，delete→删） | 否 |
-| finalizing | **单事务**：SHARE 锁分区树 → 回放剩余增量 → 摘触发器 → 搬漏网行 → `ATTACH PARTITION` → 清理 → 置 done | **仅此短暂** |
+| applying | 按 seq 顺序回放 `migration_delta`（先删 OLD 键、再 upsert NEW 键） | 否 |
+| finalizing | **单事务**：SHARE 锁分区树 → 回放剩余增量 → 摘触发器 → **反连接对账删陈旧行** → 搬漏网行 → `ATTACH PARTITION` → 清理 → 置 done | **仅此短暂** |
 
-正确性要点：
+正确性要点（含采集端"更正观测身份"，即 UPDATE 改变主键）：
 
 - 影子表在 `ATTACH` 前不属于父表，父表查询任何时刻都只见到一份数据——不重复、不缺失；
-- 复制期间的所有变更由触发器落 `migration_delta`，回放幂等，可重复执行；
+- 触发器对每条变更同时记录 OLD/NEW 两套键：同月改站号/改时刻时两者不同，
+  跨月移动时其一为空。回放严格按 seq **先删 OLD 键再写 NEW 键**，
+  因此跨批复制期间发生的改键不会把已复制的旧观测留在影子表，
+  "删旧键 → 同键插新观测"的复用场景也以最新提交值为准；
+- 回放全部幂等（delete 按 OLD 键删、insert/update 按 NEW 键 upsert），
+  回放中断或进程崩溃后重试可安全重复，已回放的增量不会复活旧记录；
+- finalizing 在挡住所有写的 SHARE 锁内做**状态对账**：删除影子表中与默认分区
+  权威状态同键但测值不符的陈旧行，再搬迁默认分区全部剩余行，
+  切换后父表内容严格等于采集端已提交内容——旧观测不复活、新观测不丢失；
 - 最终切换是**一个事务**，要么全部生效要么整体回滚，崩溃不会留下半吊子状态；
 - 任意时刻进程死亡：影子表/增量/进度都在库里，重试从断点继续（影子表不清空、复制按
   最后主键续传、增量继续累积）；
@@ -72,16 +81,19 @@ PGHOME=/path/to/pgsql PY=python3 bash scripts/dev_up.sh   # 初始化DB+种子+�
 DATABASE_URL=postgresql://envmon@127.0.0.1:5544/envmon python3 scripts/selftest.py
 ```
 
-覆盖：慢复制+并发直接 SQL 增删改后父表逐行一致；一次只迁一个月；已完成月份幂等；
-copying/finalizing 故障注入后重试成功；复制进行中进程硬退出（`os._exit`）后
-父表仍完整可查可写、重启后续迁完成；触发器/增量/默认分区残留清理检查。
+覆盖：慢复制+并发直接 SQL 增删改（含随机改站号）后父表逐行一致；一次只迁一个月；
+已完成月份幂等；copying/finalizing 故障注入后重试成功；复制进行中进程硬退出
+（`os._exit`）后父表仍完整可查可写、重启后续迁完成；
+**改站号/改同月时刻/旧键删除后复用/跨月移动的确定性交错**（含 applying 回放中断
+重试、硬退出前后两轮改键）；触发器/增量/默认分区残留清理检查。
 
 ## API 摘要
 
 - `GET  /api/state` 月份总览与迁移进度
 - `POST /api/migrate` `{month, batch_size, sleep_ms, fail_at}` 启动迁移（409=进行中/已完成）
 - `GET  /api/query?month=` 父表查询（行数/重复数/样本）
-- `POST /api/demo/write` `{op, month}` 独立连接直接 SQL 增/改/删
+- `POST /api/demo/write` `{op, month}` 独立连接直接 SQL 增/改/删/改站号/改时刻/跨月
+  （op：`insert` `update` `delete` `rekey_station` `rekey_ts` `move_month`）
 - `POST /api/demo/auto` `{enabled, month, interval_ms}` 自动采集写入开关
 - `GET  /api/verify?month=` 一致性校验
 - `POST /api/debug/crash` 进程硬退出（仅自测用）
